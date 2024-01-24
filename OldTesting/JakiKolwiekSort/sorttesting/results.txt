@@ -1,0 +1,1 @@
+Current:  1100  Misses:  29 Avarage:  259.51574803149606  Max:  23766  Min:  0  Above 500matches:338
