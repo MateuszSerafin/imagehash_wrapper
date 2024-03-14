@@ -1,1 +1,0 @@
-FUNKLCJE SA sklonowanez nizszych fodlerów
