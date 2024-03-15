@@ -31,13 +31,15 @@ def process(frames, save_as):
         processed.append(((cropp_resistant8, cropp_resistant12, cropp_resistant16), framerog[1]))
     print("Done one task of {}".format(len(frames)))
     save(processed, save_as)
-
-
+    return
 
 def save(what, save_as):
     file = bz2.BZ2File(save_as, 'wb')
     pickle.dump(what, file)
+    file.flush()
+    os.fsync(file)
     file.close()
+
 def processfile(pool, file, save_dir):
     video_capture = cv2.VideoCapture(file)
 
@@ -79,8 +81,11 @@ def processfile(pool, file, save_dir):
         print("Processed videos, waiting for {} task out of {} tasks".format(taskinfo, len(tasks)))
         tasks.remove(task)
 
+
+
 if __name__=="__main__":
-    pool = concurrent.futures.ProcessPoolExecutor(16, mp_context=multiprocessing.get_context("fork"))
+    #I had it set to 4 however it resutled in broken pipe errors I don't understand why but having it as 1 fixes it.
+    pool = concurrent.futures.ProcessPoolExecutor(16, max_tasks_per_child=1)
 
     videos_dir = "videos"
     process_save_dir = "processed"
