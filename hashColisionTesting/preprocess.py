@@ -23,13 +23,10 @@ def process(frames, save_as):
     processed = []
     #frame (image) and also what frame number it is.
     for framerog in frames:
-        frame = PIL.Image.fromarray(framerog[0])
-        cropp_resistant8 = imagehash.crop_resistant_hash(frame, hash_func=custom_hash_func(imagehash.phash, 8))
-        cropp_resistant12 = imagehash.crop_resistant_hash(frame, hash_func=custom_hash_func(imagehash.phash, 12))
-        cropp_resistant16 = imagehash.crop_resistant_hash(frame, hash_func=custom_hash_func(imagehash.phash, 16))
-
-        processed.append(((cropp_resistant8, cropp_resistant12, cropp_resistant16), framerog[1]))
-    print("Done one task of {}".format(len(frames)))
+        cropp_resistant8 = imagehash.crop_resistant_hash(framerog[0], hash_func=custom_hash_func(imagehash.phash, 8))
+        #cropp_resistant12 = imagehash.crop_resistant_hash(frame, hash_func=custom_hash_func(imagehash.phash, 12))
+        #cropp_resistant16 = imagehash.crop_resistant_hash(frame, hash_func=custom_hash_func(imagehash.phash, 16))
+        processed.append((cropp_resistant8, framerog[1]))
     save(processed, save_as)
     return
 
@@ -40,7 +37,15 @@ def save(what, save_as):
     os.fsync(file)
     file.close()
 
-def processfile(pool, file, save_dir):
+def create_process(frames, save_as):
+    p = multiprocessing.Process(target=process, args=(frames, save_as))
+    p.start()
+    return p
+
+def processfile(file, save_dir):
+    #multiprocessing pool has issues with leaking memory i seriously tried a lot of stuff
+    #this is stupid but it's going to work
+
     video_capture = cv2.VideoCapture(file)
 
     frames = []
@@ -58,47 +63,40 @@ def processfile(pool, file, save_dir):
 
         if (len(frames) > 100):
             save_as = os.path.join(save_dir, os.path.basename(file) + "." + str(len(tasks)) + ".part")
-            tasks.append(pool.submit(process, frames.copy(), save_as))
+            tasks.append(create_process(frames.copy(), save_as))
             print("apeddnign additional tasks to queue current queue size {}", len(tasks))
             frames.clear()
         else:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append((frame_rgb, fps))
+            frame_pil = PIL.Image.fromarray(frame_rgb)
+            frames.append((frame_pil, fps))
 
         fps += 1
 
-
-    save_as = os.path.join(save_dir, os.path.basename(file) + str(len(tasks)) + ".part")
-    if(len(frames) != 0): tasks.append(pool.submit(process, frames.copy(), save_as))
+    save_as = os.path.join(save_dir, os.path.basename(file) + "." + str(len(tasks)) + ".part")
+    if (len(frames) != 0): tasks.append(create_process(frames.copy(), save_as))
 
     frames.clear()
     video_capture.release()
 
-    taskinfo = 0
-    for task in tasks[:]:
-        taskinfo += 1
-        task.result()
-        print("Processed videos, waiting for {} task out of {} tasks".format(taskinfo, len(tasks)))
-        tasks.remove(task)
+    for task in tasks:
+        while(task.is_alive()):
+            time.sleep(5)
+        print("Processed videos, waiting for {} task out of {} tasks")
 
-
-
-if __name__=="__main__":
-    #I had it set to 4 however it resutled in broken pipe errors I don't understand why but having it as 1 fixes it.
-    pool = concurrent.futures.ProcessPoolExecutor(16, max_tasks_per_child=1)
-
+if __name__ == "__main__":
+    # I had it set to 4 however it resutled in broken pipe errors I don't understand why but having it as 1 fixes it.
     videos_dir = "videos"
     process_save_dir = "processed"
 
-    if(not os.path.exists(videos_dir)):
+    if (not os.path.exists(videos_dir)):
         os.mkdir(videos_dir)
-    if(not os.path.exists(process_save_dir)):
+    if (not os.path.exists(process_save_dir)):
         os.mkdir(process_save_dir)
-
 
     for dir in os.listdir(videos_dir):
         joined = os.path.join(videos_dir, dir)
-        if(not os.path.isdir(joined)): continue
+        if (not os.path.isdir(joined)): continue
         for file in os.listdir(joined):
             movie = os.path.join(joined, file)
-            processfile(pool, movie, process_save_dir)
+            processfile(movie, process_save_dir)
