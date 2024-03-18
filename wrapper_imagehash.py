@@ -11,6 +11,8 @@ import cv2
 import psutil
 import time
 from collections import Counter
+from typing import TypeVar, Generic
+T = TypeVar('T')
 
 
 def hamming_distance_func(x, y):
@@ -35,6 +37,37 @@ def async_worker(frames: list[tuple[PIL.Image.Image, int]], hashfunc: callable, 
         processed.append((done, framerog[1]))
     return_pipe.put(processed)
     return
+
+
+def create_process(frames: list[tuple[PIL.Image.Image, int]], hash_func: callable) -> multiprocessing.Queue:
+    return_pipe = multiprocessing.Queue()
+    p = multiprocessing.Process(target=async_worker, args=(frames, hash_func, return_pipe))
+    p.start()
+    return return_pipe
+
+
+#good to check for errors
+class Response(Generic[T]):
+    _failed: bool = False
+    _data: Generic[T]
+    _reason: str
+
+    def __init__(self, failed: bool, data: Generic[T] = None, reason="Unknown"):
+        self._failed = failed
+        self._data = data
+        self._reason = reason
+
+    def did_fail(self) -> bool:
+        return self._failed
+
+    def fail_reason(self) -> str:
+        return self._reason
+
+    def get_data(self) -> Generic[T]:
+        return self._data
+
+    def __str__(self):
+        return f"""Failed: {self._failed}"""
 
 
 class Wrapped:
@@ -81,8 +114,8 @@ class Wrapped:
         splited = os.path.basename(file).split(".")
         basename = '.'.join(splited[0:-1])
         fileId = self._duplicate_and_fileid(basename)
-        if (fileId == None):
-            raise Exception("Should not happen")
+        if (fileId.did_fail()):
+            raise Exception(fileId.fail_reason())
 
         with bz2.BZ2File(file, "rb") as f:
             try:
@@ -90,92 +123,95 @@ class Wrapped:
                     # Should be list[tuple[list[imageHash], framenumber]]
                     toload = pickle.load(f)
                     for oneFrameHashes, oneFrameNumber in toload:
-                        self._add_to_tree(oneFrameHashes, fileId, oneFrameNumber)
+                        self._add_to_tree(oneFrameHashes, fileId.get_data(), oneFrameNumber)
 
-            except (EOFError, pickle.UnpicklingError):
-                pass
+            except (EOFError, pickle.UnpicklingError) as e:
+                if(type(e) == EOFError):
+                    pass
+                else:
+                    raise Exception("File {} is most likely corrupted please regenerate this video".format(os.path.basename(file)))
 
-    # @Nullable
-    def _duplicate_and_fileid(self, filename: str) -> int:
+    def _duplicate_and_fileid(self, filename: str) -> Response[int]:
         if (filename in self._duplicateCheck):
-            # I return none because 0 == False
-            # TODO this should return like response wrapper with true false and then integer
-            return None
+            return Response(True, reason="File already exist in internal database please change name no duplicates are allowed")
         self._duplicateCheck.add(filename)
         fileID = len(self._lookUp)
         self._lookUp.append(filename)
-        return fileID
+        return Response(False, data=fileID)
 
     # one image can contain multiple hashes therefore list[imageHash]
-    # TODO i swear i need to wrap everything over classes because it starts to not make sense
     def _add_to_tree(self, oneframe: list[imagehash], fileid: int, framenumber: int):
         for potentialsubhashes in oneframe:
             assembled = self._treeData(potentialsubhashes, framenumber, fileid)
             self._tree.add(assembled)
 
-    # False = fail
-    # True it worked
-    def add_image_pil(self, image: PIL.Image.Image, filename: str) -> bool:
-        fileID = self._duplicate_and_fileid(filename)
-        if (fileID == None):
-            return False
-        # One image = 0 frame number
-        hashes = self._hashFunc(image)
-        self._add_to_tree(hashes, fileID, 0)
-        if (self._saveDir != None):
-            file = bz2.BZ2File(os.path.join(self._saveDir, filename + ".bz2"), "wb")
-            pickle.dump([(hashes, 0)], file)
-            file.flush()
-            file.close()
-        return True
+    def add_image(self, image: PIL.Image.Image | os.PathLike, filename: str) -> Response:
+        hashes = None
+        if(isinstance(image, PIL.Image.Image)):
+            hashes = self._hashFunc(image)
+        else:
+            if (not os.path.exists(image)):
+                return Response(True, reason="File does not exist")
+            try:
+                img = PIL.Image.open(image)
+                hashes = self._hashFunc(img)
+                img.close()
+            except Exception as e:
+                return Response(True, reason=str(e))
 
-    def add_image(self, file: os.path) -> bool:
-        basename = os.path.basename(file)
-        image = PIL.Image.open(file)
-        copy = image.copy()
-        image.close()
-        return self.add_image_pil(copy, basename)
+        if(hashes == None):
+            return Response(True, reason="Wrong object provided to add_image function")
+
+        fileID = self._duplicate_and_fileid(filename)
+        if(fileID.did_fail()):
+            return fileID
+
+        self._add_to_tree(hashes, fileID.get_data(), 0)
+        if (self._saveDir != None):
+            #Lazy
+            try:
+                file = bz2.BZ2File(os.path.join(self._saveDir, filename + ".bz2"), "wb")
+                pickle.dump([(hashes, 0)], file)
+                file.flush()
+                file.close()
+            except Exception as e:
+                return Response(True, reason=str(e))
+        return Response(False)
 
     def _processed_to_tree(self, processedframes: list[list[imagehash.ImageHash], int], fileid: int):
         for listhashes, framenumber in processedframes:
             self._add_to_tree(listhashes, fileid, framenumber)
 
-
-    def _create_process(self, frames: list[tuple[PIL.Image.Image, int]], hash_func: callable) -> multiprocessing.Queue:
-        return_pipe = multiprocessing.Queue()
-        p = multiprocessing.Process(target=async_worker, args=(frames, hash_func, return_pipe))
-        p.start()
-        return return_pipe
-
-    # False = fail
-    # True it worked
     # I know it spawns too much processes but it time it was being processed
     # Also multiprocessing pool has memory leak and it breaks pipe on my machine
     # I spend lot of time debugging it but it looks like internal problem
-    def add_video(self, filename: os.path, leavethismuchmemory: int = 4096) -> bool:
-        # TODO this requires more checks
+    def add_video(self, filename: os.PathLike | str, leavethismuchmemory: int = 4096, computeeveryNframe: int = 8) -> Response:
+        cap = None
+
+
         if (not os.path.exists(filename)):
-            return False
+            return Response(True, reason="File doesn't exist")
+        #No overload for differnt types just string
+        cap = cv2.VideoCapture(str(filename))
 
-        # I assume that the file is correct by that it can definitely error
-        video_capture = cv2.VideoCapture(filename)
+        if(cap == None):
+            return Response(True, reason="Unsupported argument type")
 
-        # TODO Past this point it shouldn't be error make check to above video
         fileID = self._duplicate_and_fileid(filename)
-        if (fileID == None):
-            return False
+        if (fileID.did_fail()):
+            return fileID
 
         frames = []
         tasks = []
         fps = 0
-        # skip amount of frames
-        counter = 8
 
-        while video_capture.isOpened():
-            ret, frame = video_capture.read()
+        counter = computeeveryNframe
+
+        while cap.isOpened():
+            ret, frame = cap.read()
             if not ret:
                 break
-            if (counter > 7):
+            if (counter > computeeveryNframe):
                 while (psutil.virtual_memory().available / 1024 / 1024 < leavethismuchmemory):
                     # TODO there should be adding to tree
                     time.sleep(15)
@@ -183,7 +219,7 @@ class Wrapped:
                 if (len(frames) > 50):
                     # TODO i think there is an issue calling self._hashffunc. I think multiprocessing will break it and better would be to call CustomHashFunc() as a new object
                     # But then what is the point of self._hashfunc
-                    tasks.append(self._create_process(frames.copy(), self._hashFunc))
+                    tasks.append(create_process(frames.copy(), self._hashFunc))
                     frames.clear()
                 else:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -194,9 +230,9 @@ class Wrapped:
             fps += 1
             counter += 1
 
-        if (len(frames) != 0): tasks.append(self._create_process(frames.copy(), self._hashFunc))
+        if (len(frames) != 0): tasks.append(create_process(frames.copy(), self._hashFunc))
         frames.clear()
-        video_capture.release()
+        cap.release()
 
         if (self._saveDir != None):
             file = bz2.BZ2File(os.path.join(self._saveDir, os.path.basename(filename) + ".bz2"), "wb")
@@ -205,30 +241,29 @@ class Wrapped:
 
         for task in tasks:
             return_from_task = task.get()
-            self._processed_to_tree(return_from_task, fileID)
+            self._processed_to_tree(return_from_task, fileID.get_data())
             if (file != None):
                 pickle.dump(return_from_task, file)
 
-    # @Nullable
-    def _match_video(self, hashesList: list[list[imagehash.ImageHash]], hamming_distance: int = 24) -> str:
+    def _match_video(self, hashesList: list[list[imagehash.ImageHash]], hamming_distance: int = 24) -> str | bool:
         mostCommon = []
         for frame in hashesList:
             mostCommon.extend(
                 self._internal_matcher(frame, hamming_distance=hamming_distance, skipFrameInformation=True))
         if (len(mostCommon) == 0):
-            return None
+            return False
         # TODO this should return multiple matches if they have the same weight
         fileID = Counter(mostCommon).most_common(1)[0][0]
         return self._lookUp[fileID]
 
-    # @Nullable
-    def _match_exact_frame(self, hashes: list[imagehash.ImageHash], hamming_distance: int = 24) -> tuple[str, int]:
+
+    def _match_exact_frame(self, hashes: list[imagehash.ImageHash], hamming_distance: int = 24) -> tuple[str, int] | bool:
         internalResult = self._internal_matcher(hashes, hamming_distance=hamming_distance)
         # TODO this should return multiple matches if they have the same weight
         if (len(internalResult) == 0):
-            return None
+            return False
         fileID, frameNumber = Counter(internalResult).most_common(1)[0][0]
-        return self._lookUp[fileID], frameNumber * 8
+        return self._lookUp[fileID], frameNumber
 
     # this was wrriten heavy in mind of ImageMultiHash class not sure if it works with regular phash,dhash etc
     # all it does it collects most common fileids on each frame and then again collects it and this is the result
@@ -236,8 +271,8 @@ class Wrapped:
     def _internal_matcher(self, hashes: list[imagehash.ImageHash], hamming_distance: int = 24,
                           skipFrameInformation=False):
         most_frequent = []
-        for hash in hashes:
-            assembled = self._treeData(hash, None, None)
+        for hashFromTree in hashes:
+            assembled = self._treeData(hashFromTree, None, None)
             result = self._tree.find(assembled, hamming_distance)
 
             sorter = {}
@@ -257,14 +292,14 @@ class Wrapped:
             most_frequent.extend(list(sorter[min_value]))
         return most_frequent
 
-    # TODO this should return response object failed or not and result
-    # Also it can return multiple matches as matching is not perfect end user
-    # @Nullable
-    def match_video(self, file: os.path, hamming_distance: int = 24) -> str:
+    def match_video(self, file: os.path, hamming_distance: int = 3) -> Response[str] | Response[bool]:
         if (not os.path.exists(file)):
-            raise Exception("File does not exist")
-
+            return Response(True, reason="File doesn't exist")
         cap = cv2.VideoCapture(file)
+
+        if(cap == None):
+            return Response(True, reason="Unsupported argument type")
+
 
         frameCount = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         randomIndices = random.sample(range(frameCount), 10)
@@ -279,32 +314,57 @@ class Wrapped:
             pil_images.append(self._hashFunc(pil_image))
 
         cap.release()
-        return self._match_video(pil_images, hamming_distance=hamming_distance)
+        return Response(failed=False, data=self._match_video(pil_images, hamming_distance=hamming_distance))
 
-    # @Nullable
-    def match_frame(self, image: PIL.Image.Image, hamming_distance=24):
-        hashed = self._hashFunc(image)
-        return self._match_exact_frame(hashed, hamming_distance=hamming_distance)
+    def match_frame(self, image: PIL.Image.Image, hamming_distance=3) -> Response[tuple[str, int]] | Response[bool]:
+        hashes = None
+        if(isinstance(image, PIL.Image.Image)):
+            hashes = self._hashFunc(image)
+        else:
+            if(not os.path.exists(image)):
+                return Response(True, reason="File does not exist")
+            img = PIL.Image.open(image)
+            hashes = self._hashFunc(img)
+            img.close()
 
-    # @Nullable
-    def match_one_video_multiple_frames(self, listImages: list[PIL.Image.Image], hamming_distance=24):
+        if(hashes == None):
+            return Response(True, reason="Wrong object provided to add_image function")
+
+        return Response(failed=False, data=self._match_exact_frame(hashes, hamming_distance=hamming_distance))
+
+    def match_one_video_multiple_frames(self, listImages: list[PIL.Image.Image], hamming_distance=24) -> str | bool:
         hashes = []
         for image in listImages:
             hashes.append(self._hashFunc(image))
         return self._match_video(hashes, hamming_distance=hamming_distance)
 
 
-#if __name__ == "__main__":
-    #custom = Wrapped(savedir="mydirectory")
-    # for img in tqdm.tqdm(os.listdir("samples")):
-    #   custom.add_image(os.path.join("samples", img))
+if __name__ == "__main__":
+    custom = Wrapped(savedir="mydirectory")
 
-    #print(custom.match_frame(PIL.Image.open("Untitled.png")))
-    #video = "C:/Users/MSI/Videos/2023-04-17 20-02-39.mp4"
-    # custom.add_video(video)
-    #print(custom.match_video(video))
-    # print(list(custom._tree))
-    # among = [custom._hashFunc(PIL.Image.open("samples/Rick and Morty S06E06.mp4.5551.png"))]
-    # print(custom._match_video(among))
-    # print(len(list(custom._tree)))
-    # print(list(custom._tree))
+    custom.add_video("vid1.mp4")
+
+    #False means not found
+    assert custom.match_video("vid2.mp4", hamming_distance=3).get_data() == False
+
+    #Increasing hamming distance makes it match frames that are not necessary from same video.
+    #This cannot be changed as matching less similar images literary means that it can match somethning that is different
+    #matches vid1 even we put vid2 as a reference
+    assert custom.match_video("vid2.mp4", hamming_distance=12).get_data() == "vid1.mp4"
+
+    custom.add_video("vid2.mp4")
+
+    #However after adding vid2 to binary tree it became the best match even with same hamming_distance please be aware of this behaviour
+    assert custom.match_video("vid2.mp4", hamming_distance=12).get_data() == "vid2.mp4"
+
+    #screen shot includes part of windows player, it changes hashes therefore it needs increased hamming distance
+    #If windows player would be cropped out hamming_distance of 3 would be enough
+    #Please take this information to consideration with your project
+    #TODO do test to make sure that frames are matched within sensible amount of frames
+    assert custom.match_frame("screenshotvid1_54.png", hamming_distance=16).get_data() == ("vid1.mp4", 64)
+
+    #Check to make sure that loading is working properly
+    assert list(Wrapped(savedir="mydirectory")._tree) == list(custom._tree)
+
+    #Doesn't scream when __main__ is empty
+    pass

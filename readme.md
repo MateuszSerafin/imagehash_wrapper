@@ -3,50 +3,42 @@ imagehash_wrapper
 
 imagehash_wrapper is a wrapper around imagehash using pybktree and other libraries. What it allows you to hash images, videos and check if they already exist in your database using simple function calls. You don't have to implement anything on your own mess around with settings etc.
 
-Install depedencies 
-::
+Install depedencies
 
     pip install pybktree imagehash python-opencv psutil
 
 Then you need to copy wrapper_imagehash.py to your project, I might or might not upload it to pip. For now copying is the way.
 
-.. code:: python
+## Example usage
 
-    >>> from wrapper_imagehash import Wrapped()
-    >>> instance = Wrapped()
-    >>> instance.add_video("vid1.mp4")
-    >>> instance.add_video("vid2.mp4")
-    #match_frame tries to match frame that matches best in this case its vid1 448th frame
-    >>> instance.match_frame(PIL.Image.open("screenshotvid1.png"))
-    ('vid1.mp4', 448)
-    >>> instance.match_video("vid2.mp4")
-    'vid2.mp4'
-    #Vid3 not added to the tree result unknown, increasing hamming distance might yield not wanted results
-    >>> type(instance.match_video("vid3.mp4"))
-    <class 'NoneType'>
+    custom = Wrapped(savedir="mydirectory")
 
-My lib allows also is not only for videos but supports images too. Please look at class definition
-### class Wrapper:
-#### .__ init __(savedir: os.path, hashfunc: CustomHashFunc)
-###### savedir, if save dir is specified all of added images videos when computed will be added to this directory. When creating instance it will also load this data.
+    custom.add_video("vid1.mp4")
 
-###### hashfunc, I am using currently imagehash.cropresistanthash you can change to phash or type of hash however you need to change it please look at my code how it looks like.
+    #False means not found
+    assert custom.match_video("vid2.mp4", hamming_distance=3).get_data() == False
 
-#### .add_image_pil(image: PIL.Image.Image, filename: str) -> bool
-This will add image to internal database make sure that filename is unique otherwise it will reject it. It will result false if it encounters issue and true if it sucessfully worked.
+    #Increasing hamming distance makes it match frames that are not necessary from same video.
+    #This cannot be changed as matching less similar images literary means that it can match somethning that is different
+    #matches vid1 even we put vid2 as a reference
+    assert custom.match_video("vid2.mp4", hamming_distance=12).get_data() == "vid1.mp4"
 
-#### .add_image(file: os.path) -> bool
-Internally calls add_image_pil, please make sure that this file exist currently not a lot of issue handling is implemented. False = failed
+    custom.add_video("vid2.mp4")
 
-#### .add_video(filename: os.path, leavethismuchmemory: int)
-###### leavethismuchmemory, i am using multiprocessing for faster computing of hashes, make sure to put a sensible limit on it otherwise while processing big files it might take 95% of your ram
+    #However after adding vid2 to binary tree it became the best match even with same hamming_distance please be aware of this behaviour
+    assert custom.match_video("vid2.mp4", hamming_distance=12).get_data() == "vid2.mp4"
 
-#### .match_video(file: os.path, hamming_distance: int) -> str
-###### hamming_distance, put higher value the more your frame is disorted.
-It might return None be carefull, it will return None only if it won't find anything in internal database (within hamming_distance), Otherwise it returns a exact filename of video that matches the best
+    #screen shot includes part of windows player, it changes hashes therefore it needs increased hamming distance
+    #If windows player would be cropped out hamming_distance of 3 would be enough
+    #Please take this information to consideration with your project
+    #TODO do test to make sure that frames are matched within sensible amount of frames
+    assert custom.match_frame("screenshotvid1_54.png", hamming_distance=16).get_data() == ("vid1.mp4", 64)
 
-#### .match_frame(image: PIL.Image.Image, hamming_distance:int) -> tuple(str, int)
-Bassically the same as above function difference is you call it with a single frame and it results in tuple with filename and framenumber that most fits. 
+    #Check to make sure that loading is working properly
+    assert list(Wrapped(savedir="mydirectory")._tree) == list(custom._tree)
+## Benchmarks
+TODO, my implementation is working but not sure where is limit of for example 8 bit hashes, not sure about it's speed on scale, 
 
-#### .match_one_video_multiple_frames(self, listImages: list[PIL.Image.Image], hamming_distance=24) -> str
-Internally match_video calls this function, if you have multiple screenshots of same video you can call that and it takes account of all frames to match a video.
+## Acknowledgements 
+[imagehash](https://github.com/JohannesBuchner/imagehash) - Code for image hashing, base of my wrapper
+<br> [pybktree](https://github.com/benhoyt/pybktree) - Code for binary tree, no need to reinvent the wheel working nicely.
